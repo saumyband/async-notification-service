@@ -195,9 +195,9 @@ The API returns an import summary:
 
 ```json
 {
-  "totalRecords": 12,
+  "totalRecords": 11,
   "imported": 6,
-  "duplicates": 5,
+  "duplicates": 4,
   "invalid": 1
 }
 ```
@@ -208,6 +208,7 @@ The implementation uses:
 
 - Apache Commons CSV for CSV parsing
 - Streaming file processing
+- Header-based field extraction
 - `HashSet` for in-file duplicate detection
 - Batch processing
 - MongoDB bulk lookup using `findByEmailIn(...)`
@@ -216,6 +217,19 @@ The implementation uses:
 - File-size limits to protect the upload endpoint
 
 This avoids performing an individual database lookup and insert for every CSV row.
+
+The test file deliberately included valid records, duplicate/existing subscriber emails, and an invalid email address.
+
+![Bulk CSV Import](screenshots/csv-import.png)
+
+In this test:
+
+| Result | Count |
+|---|---:|
+| Total Records | 11 |
+| Imported | 6 |
+| Duplicates | 4 |
+| Invalid | 1 |
 
 ---
 
@@ -292,13 +306,49 @@ Example response while processing:
 }
 ```
 
-The React frontend polls this endpoint periodically and updates the delivery progress automatically.
+The React frontend polls this endpoint every two seconds and updates the delivery progress automatically.
 
 Polling stops once:
 
 ```text
 pending = 0
 ```
+
+### Live Asynchronous Processing
+
+The following screenshot captures the notification while RabbitMQ consumers are still processing messages.
+
+![Notification Processing](screenshots/dashboard-processing.png)
+
+At this point:
+
+```text
+Total:      7
+Sent:       4
+Pending:    3
+Failed:     0
+Processed: 57%
+```
+
+The original HTTP request has already completed, while delivery processing continues asynchronously in the background.
+
+### Processing Completed
+
+Once all recipients have been processed, `pending` reaches zero and the frontend stops polling.
+
+![Notification Processing Completed](screenshots/dashboard-completed.png)
+
+Final state:
+
+```text
+Total:      7
+Sent:       7
+Pending:    0
+Failed:     0
+Processed: 100%
+```
+
+This demonstrates the distinction between **HTTP request completion** and **background processing completion**.
 
 ---
 
@@ -338,6 +388,33 @@ The implementation prevents permanently failing messages from being retried inde
 
 A failed delivery retains failure information in MongoDB so RabbitMQ is not used as the application's historical business-state store.
 
+### RabbitMQ Queue and DLQ
+
+The application maintains the primary notification queue and a dedicated dead-letter queue.
+
+![RabbitMQ Queue and DLQ](screenshots/rabbitmq-dlq.png)
+
+The primary `notification.queue` is configured with dead-letter routing. When retry attempts are exhausted, the rejected message is routed through the dead-letter exchange toward `notification.dlq`.
+
+### Failure Tracking
+
+Failure handling is also reflected in the application's persistent delivery state.
+
+![Delivery Failure Tracking](screenshots/delivery-failure.png)
+
+In the failure-handling test:
+
+```text
+Total:    11
+Sent:     10
+Pending:   0
+Failed:    1
+```
+
+The permanently failed delivery is persisted as `FAILED`, allowing the status API and frontend to expose the final business outcome.
+
+> RabbitMQ is responsible for message transport and failure routing, while MongoDB stores the application's delivery state and history.
+
 ---
 
 ## Email Delivery
@@ -358,17 +435,23 @@ Recipient
 
 A delivery is marked `SENT` after the SMTP send operation completes successfully.
 
+### Real Email Delivery
+
+![Real Email Delivery](screenshots/gmail-delivery.png)
+
+The screenshot demonstrates an actual notification submitted through the application and delivered to a Gmail inbox after asynchronous processing through Spring Boot, RabbitMQ, and Gmail SMTP.
+
 > SMTP acceptance indicates that the provider accepted the send operation; it does not guarantee that the recipient opened or read the email.
 
 ---
 
 ## Synchronous vs Asynchronous Processing
 
-The functionality was initially implemented synchronously to establish a baseline.
+The functionality was initially implemented synchronously to establish a measurable baseline before introducing RabbitMQ.
 
 ### Synchronous Implementation
 
-With 11 recipients and simulated downstream latency:
+With **11 recipients** and simulated downstream email latency:
 
 ```text
 11 recipients
@@ -379,6 +462,10 @@ API waits for completion
       ↓
 Response time ≈ 6.31 seconds
 ```
+
+![Synchronous API Response](screenshots/synchronous-response.png)
+
+The HTTP request remained blocked while all recipient operations were processed.
 
 ### RabbitMQ Implementation
 
@@ -402,9 +489,20 @@ Consumers
 Email processing continues independently
 ```
 
-The API returned in **milliseconds during local testing**, while email processing continued asynchronously.
+In one local test run, the asynchronous API returned in approximately **26 ms**, while delivery processing continued in the background.
 
-> RabbitMQ reduces user-facing request latency by decoupling long-running work from the HTTP request. It does not mean the total email-processing time becomes zero.
+![Asynchronous API Response](screenshots/async-response.png)
+
+### Observed Comparison
+
+| Implementation | Test Recipients | Observed API Response |
+|---|---:|---:|
+| Synchronous | 11 | ~6.31 seconds |
+| RabbitMQ-based asynchronous | 11 | ~26 ms |
+
+> These figures represent individual local test runs and are included to demonstrate the behavioral difference between synchronous and asynchronous request processing. They are not production performance guarantees.
+
+> RabbitMQ reduces user-facing request latency by decoupling long-running work from the HTTP request. It does **not** make the underlying email-delivery operation instantaneous.
 
 ---
 
@@ -425,33 +523,50 @@ The frontend uses React hooks including:
 - `useState`
 - `useEffect`
 
-Delivery progress is retrieved through periodic status API polling.
+When a newsletter is submitted:
+
+```text
+NewsletterForm
+      ↓
+POST /api/notifications
+      ↓
+notificationId
+      ↓
+App state
+      ↓
+DeliveryStatus
+      ↓
+useEffect
+      ↓
+GET status every 2 seconds
+      ↓
+Update React state
+      ↓
+Re-render progress
+      ↓
+pending = 0
+      ↓
+Stop polling
+```
+
+This keeps the UI updated while asynchronous processing continues without requiring the user to manually refresh the page.
 
 ---
 
 ## Screenshots
 
-### Asynchronous Processing in Progress
+The following screenshots are used throughout this README as evidence of the implemented flows.
 
-![Notification processing](screenshots/dashboard-processing.png)
-
-The frontend displays notification progress while RabbitMQ consumers process messages asynchronously.
-
-### Processing Completed
-
-![Notification completed](screenshots/dashboard-completed.png)
-
-### Synchronous Performance Baseline
-
-![Synchronous response](screenshots/synchronous-response.png)
-
-### RabbitMQ Queue and Dead-Letter Queue
-
-![RabbitMQ queues](screenshots/rabbitmq-dlq.png)
-
-### Real Email Delivery
-
-![Email delivery](screenshots/gmail-delivery.png)
+| Screenshot | Demonstrates |
+|---|---|
+| `dashboard-processing.png` | React displaying asynchronous processing at 57% |
+| `dashboard-completed.png` | Delivery processing completed at 100% |
+| `synchronous-response.png` | ~6.31 second synchronous baseline |
+| `async-response.png` | ~26 ms asynchronous API response in a local test |
+| `rabbitmq-dlq.png` | RabbitMQ primary queue and dead-letter queue |
+| `delivery-failure.png` | Persistent result with 10 SENT and 1 FAILED |
+| `csv-import.png` | Bulk CSV validation, duplicate detection, and import summary |
+| `gmail-delivery.png` | Actual Gmail SMTP email delivery |
 
 ---
 
@@ -542,7 +657,16 @@ spring.mail.password=${MAIL_APP_PASSWORD}
 spring.data.mongodb.uri=${MONGODB_URI:mongodb://localhost:27017/notification_system_db}
 ```
 
+For local development, secrets can be supplied through the IDE/runtime environment.
+
 For production deployments, secrets should be supplied through the deployment platform or a dedicated secrets-management solution rather than committed to the repository.
+
+Examples include:
+
+- AWS Secrets Manager
+- Azure Key Vault
+- HashiCorp Vault
+- Kubernetes Secrets
 
 ---
 
@@ -621,7 +745,10 @@ async-notification-system/
 │   ├── dashboard-processing.png
 │   ├── dashboard-completed.png
 │   ├── synchronous-response.png
+│   ├── async-response.png
 │   ├── rabbitmq-dlq.png
+│   ├── delivery-failure.png
+│   ├── csv-import.png
 │   └── gmail-delivery.png
 │
 └── README.md
@@ -649,11 +776,29 @@ Messages that repeatedly fail should not be retried indefinitely or interfere wi
 
 **Why CSV streaming and batching?**
 
-It reduces unnecessary memory usage and database round trips compared with materializing the entire import and performing one query/write per row.
+It reduces unnecessary memory usage and database round trips compared with materializing all Subscriber entities and performing one query/write per row.
+
+The implementation still maintains a `HashSet` of normalized emails for within-file duplicate detection, so memory usage for duplicate tracking grows with the number of unique records. The upload endpoint therefore has a bounded file-size limit.
+
+**Why Apache Commons CSV instead of manually splitting lines?**
+
+CSV supports quoting, escaping, delimiters, and multiple columns. Apache Commons CSV handles these rules and allows the application to retrieve the required value by header name, for example:
+
+```java
+record.get("email")
+```
+
+instead of depending on a fixed column position or using `String.split(",")`.
 
 **Why database uniqueness if duplicates are already checked in Java?**
 
 Application checks provide convenient duplicate handling, while the database unique index provides the final consistency guarantee against concurrent requests.
+
+**Why polling instead of WebSocket/SSE?**
+
+Delivery updates do not require sub-second real-time communication for this scope. Short-lived polling keeps the frontend/backend design simple, and polling stops automatically when processing completes.
+
+For larger-scale or highly real-time requirements, Server-Sent Events or WebSockets could be considered.
 
 ---
 
@@ -672,6 +817,26 @@ Potential extensions include:
 - Provider abstraction for different email services
 - Metrics and distributed tracing
 - Transactional Outbox for stronger database/message consistency
+- Idempotent consumer handling for duplicate message delivery
+- Asynchronous processing for extremely large CSV imports
+
+---
+
+## Production Considerations
+
+The current implementation demonstrates production-oriented patterns while intentionally keeping the project scope manageable.
+
+For a larger production deployment, additional considerations would include:
+
+- **Transactional Outbox** to handle the consistency gap between database persistence and RabbitMQ publishing.
+- **Idempotent consumers** because message brokers can redeliver messages.
+- **Production email providers** such as Amazon SES or similar services instead of a personal Gmail SMTP account.
+- **Consumer concurrency and prefetch tuning** based on workload and downstream rate limits.
+- **Centralized metrics and monitoring** for queue depth, retries, DLQ messages, delivery failures, API latency, JVM health, and SMTP latency.
+- **Authentication and authorization** for administrative notification and bulk-import endpoints.
+- **Asynchronous import jobs/object storage** for very large subscriber files.
+
+These are architectural evolution points rather than claims that the current demonstration implements every large-scale production concern.
 
 ---
 
@@ -682,16 +847,44 @@ The project focuses on practical backend and full-stack engineering concepts:
 - Synchronous vs asynchronous processing
 - Message-driven architecture
 - Producer/consumer communication
+- RabbitMQ queue processing
 - Retry and exponential backoff
-- Dead-letter queues
+- Dead-letter exchange and dead-letter queue
 - REST API design
 - HTTP `202 Accepted`
 - Eventual consistency
 - Delivery-state tracking
-- Bulk data processing
+- Bulk CSV processing
+- Streaming file parsing
 - Database batching
 - Duplicate handling
+- Database uniqueness
 - External SMTP integration
 - Runtime configuration and secret management
-- React state management and polling
+- React state management
+- React `useEffect` lifecycle and cleanup
+- Status API polling
+- CORS configuration
 - End-to-end full-stack integration
+
+---
+
+## Summary
+
+This project started with a simple synchronous bulk notification workflow and evolved into an asynchronous, observable, and failure-aware notification-processing system.
+
+The main engineering objective was not simply to introduce RabbitMQ, but to address the broader concerns created by long-running external operations:
+
+```text
+Responsiveness
+      +
+Asynchronous Processing
+      +
+Failure Handling
+      +
+Delivery Visibility
+      +
+Bulk Data Processing
+```
+
+The resulting implementation demonstrates how Spring Boot, RabbitMQ, MongoDB, SMTP, and React can work together to provide a practical full-stack notification capability.
